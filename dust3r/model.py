@@ -4,38 +4,44 @@
 # --------------------------------------------------------
 # DUSt3R model class
 # --------------------------------------------------------
-from copy import deepcopy
-import torch
 import os
-from packaging import version
-import huggingface_hub
+from copy import deepcopy
 
-from .utils.misc import fill_default_args, freeze_all_params, is_symmetrized, interleave, transpose_to_landscape
-from .heads import head_factory
+try:
+    import dust3r.utils.path_to_croco  # noqa: F401
+except ImportError:
+    pass
+
+import torch
+import huggingface_hub
+from packaging import version
+from models.croco import CroCoNet  # noqa: F401
+
 from dust3r.patch_embed import get_patch_embed
 
-import dust3r.utils.path_to_croco  # noqa: F401
-from models.croco import CroCoNet  # noqa
+from .heads import head_factory
+from .utils.misc import interleave, is_symmetrized, fill_default_args, freeze_all_params, transpose_to_landscape
 
 inf = float('inf')
 
 hf_version_number = huggingface_hub.__version__
-assert version.parse(hf_version_number) >= version.parse("0.22.0"), ("Outdated huggingface_hub version, "
-                                                                     "please reinstall requirements.txt")
+assert version.parse(hf_version_number) >= version.parse('0.22.0'), (
+    'Outdated huggingface_hub version, please reinstall requirements.txt'
+)
 
 
 def load_model(model_path, device, verbose=True):
     if verbose:
         print('... loading model from', model_path)
     ckpt = torch.load(model_path, map_location='cpu')
-    args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
+    args = ckpt['args'].model.replace('ManyAR_PatchEmbed', 'PatchEmbedDust3R')
     if 'landscape_only' not in args:
         args = args[:-1] + ', landscape_only=False)'
     else:
-        args = args.replace(" ", "").replace('landscape_only=True', 'landscape_only=False')
-    assert "landscape_only=False" in args
+        args = args.replace(' ', '').replace('landscape_only=True', 'landscape_only=False')
+    assert 'landscape_only=False' in args
     if verbose:
-        print(f"instantiating : {args}")
+        print(f'instantiating : {args}')
     net = eval(args)
     s = net.load_state_dict(ckpt['model'], strict=False)
     if verbose:
@@ -43,27 +49,29 @@ def load_model(model_path, device, verbose=True):
     return net.to(device)
 
 
-class AsymmetricCroCo3DStereo (
+class AsymmetricCroCo3DStereo(
     CroCoNet,
     huggingface_hub.PyTorchModelHubMixin,
-    library_name="dust3r",
-    repo_url="https://github.com/naver/dust3r",
-    tags=["image-to-3d"],
+    library_name='dust3r',
+    repo_url='https://github.com/naver/dust3r',
+    tags=['image-to-3d'],
 ):
-    """ Two siamese encoders, followed by two decoders.
+    """Two siamese encoders, followed by two decoders.
     The goal is to output 3d points directly, both images in view1's frame
-    (hence the asymmetry).   
+    (hence the asymmetry).
     """
 
-    def __init__(self,
-                 output_mode='pts3d',
-                 head_type='linear',
-                 depth_mode=('exp', -inf, inf),
-                 conf_mode=('exp', 1, inf),
-                 freeze='none',
-                 landscape_only=True,
-                 patch_embed_cls='PatchEmbedDust3R',  # PatchEmbedDust3R or ManyAR_PatchEmbed
-                 **croco_kwargs):
+    def __init__(
+        self,
+        output_mode='pts3d',
+        head_type='linear',
+        depth_mode=('exp', -inf, inf),
+        conf_mode=('exp', 1, inf),
+        freeze='none',
+        landscape_only=True,
+        patch_embed_cls='PatchEmbedDust3R',  # PatchEmbedDust3R or ManyAR_PatchEmbed
+        **croco_kwargs,
+    ):
         self.patch_embed_cls = patch_embed_cls
         self.croco_args = fill_default_args(croco_kwargs, super().__init__)
         super().__init__(**croco_kwargs)
@@ -80,7 +88,7 @@ class AsymmetricCroCo3DStereo (
         else:
             try:
                 model = super(AsymmetricCroCo3DStereo, cls).from_pretrained(pretrained_model_name_or_path, **kw)
-            except TypeError as e:
+            except TypeError:
                 raise Exception(f'tried to load {pretrained_model_name_or_path} from huggingface, but failed')
             return model
 
@@ -107,13 +115,15 @@ class AsymmetricCroCo3DStereo (
         freeze_all_params(to_be_frozen[freeze])
 
     def _set_prediction_head(self, *args, **kwargs):
-        """ No prediction head """
+        """No prediction head"""
         return
 
-    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
-                            **kw):
-        assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, \
+    def set_downstream_head(
+        self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size, **kw
+    ):
+        assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, (
             f'{img_size=} must be multiple of {patch_size=}'
+        )
         self.output_mode = output_mode
         self.head_type = head_type
         self.depth_mode = depth_mode
@@ -141,8 +151,9 @@ class AsymmetricCroCo3DStereo (
 
     def _encode_image_pairs(self, img1, img2, true_shape1, true_shape2):
         if img1.shape[-2:] == img2.shape[-2:]:
-            out, pos, _ = self._encode_image(torch.cat((img1, img2), dim=0),
-                                             torch.cat((true_shape1, true_shape2), dim=0))
+            out, pos, _ = self._encode_image(
+                torch.cat((img1, img2), dim=0), torch.cat((true_shape1, true_shape2), dim=0)
+            )
             out, out2 = out.chunk(2, dim=0)
             pos, pos2 = pos.chunk(2, dim=0)
         else:
@@ -203,7 +214,7 @@ class AsymmetricCroCo3DStereo (
         # combine all ref images into object-centric representation
         dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
             res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
 

@@ -6,26 +6,33 @@
 # --------------------------------------------------------
 from copy import deepcopy
 
+import roma
+import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
-import roma
-from copy import deepcopy
-import tqdm
 
-from dust3r.utils.geometry import inv, geotrf
-from dust3r.utils.device import to_numpy
-from dust3r.utils.image import rgb
-from dust3r.viz import SceneViz, segment_sky, auto_cam_size
-from dust3r.optim_factory import adjust_learning_rate_by_lr
-
-from dust3r.cloud_opt.commons import (edge_str, ALL_DISTS, NoGradParamDict, get_imshapes, signed_expm1, signed_log1p,
-                                      cosine_schedule, linear_schedule, get_conf_trf)
 import dust3r.cloud_opt.init_im_poses as init_fun
+from dust3r.viz import SceneViz, segment_sky, auto_cam_size
+from dust3r.utils.image import rgb
+from dust3r.utils.device import to_numpy
+from dust3r.optim_factory import adjust_learning_rate_by_lr
+from dust3r.utils.geometry import inv, geotrf
+from dust3r.cloud_opt.commons import (
+    ALL_DISTS,
+    NoGradParamDict,
+    edge_str,
+    get_conf_trf,
+    get_imshapes,
+    signed_expm1,
+    signed_log1p,
+    cosine_schedule,
+    linear_schedule,
+)
 
 
-class BasePCOptimizer (nn.Module):
-    """ Optimize a global scene, given a list of pairwise observations.
+class BasePCOptimizer(nn.Module):
+    """Optimize a global scene, given a list of pairwise observations.
     Graph node: images
     Graph edges: observations = (pred1, pred2)
     """
@@ -33,24 +40,30 @@ class BasePCOptimizer (nn.Module):
     def __init__(self, *args, **kwargs):
         if len(args) == 1 and len(kwargs) == 0:
             other = deepcopy(args[0])
-            attrs = '''edges is_symmetrized dist n_imgs pred_i pred_j imshapes 
+            attrs = """edges is_symmetrized dist n_imgs pred_i pred_j imshapes 
                         min_conf_thr conf_thr conf_i conf_j im_conf
                         base_scale norm_pw_scale POSE_DIM pw_poses 
-                        pw_adaptors pw_adaptors has_im_poses rand_pose imgs verbose'''.split()
+                        pw_adaptors pw_adaptors has_im_poses rand_pose imgs verbose""".split()
             self.__dict__.update({k: other[k] for k in attrs})
         else:
             self._init_from_views(*args, **kwargs)
 
-    def _init_from_views(self, view1, view2, pred1, pred2,
-                         dist='l1',
-                         conf='log',
-                         min_conf_thr=3,
-                         base_scale=0.5,
-                         allow_pw_adaptors=False,
-                         pw_break=20,
-                         rand_pose=torch.randn,
-                         iterationsCount=None,
-                         verbose=True):
+    def _init_from_views(
+        self,
+        view1,
+        view2,
+        pred1,
+        pred2,
+        dist='l1',
+        conf='log',
+        min_conf_thr=3,
+        base_scale=0.5,
+        allow_pw_adaptors=False,
+        pw_break=20,
+        rand_pose=torch.randn,
+        iterationsCount=None,
+        verbose=True,
+    ):
         super().__init__()
         if not isinstance(view1['idx'], list):
             view1['idx'] = view1['idx'].tolist()
@@ -87,7 +100,7 @@ class BasePCOptimizer (nn.Module):
         self.norm_pw_scale = True
         self.pw_break = pw_break
         self.POSE_DIM = 7
-        self.pw_poses = nn.Parameter(rand_pose((self.n_edges, 1+self.POSE_DIM)))  # pairwise poses
+        self.pw_poses = nn.Parameter(rand_pose((self.n_edges, 1 + self.POSE_DIM)))  # pairwise poses
         self.pw_adaptors = nn.Parameter(torch.zeros((self.n_edges, 2)))  # slight xy/z adaptation
         self.pw_adaptors.requires_grad_(allow_pw_adaptors)
         self.has_im_poses = False
@@ -96,7 +109,7 @@ class BasePCOptimizer (nn.Module):
         # possibly store images for show_pointcloud
         self.imgs = None
         if 'img' in view1 and 'img' in view2:
-            imgs = [torch.zeros((3,)+hw) for hw in self.imshapes]
+            imgs = [torch.zeros((3,) + hw) for hw in self.imshapes]
             for v in range(len(self.edges)):
                 idx = view1['idx'][v]
                 imgs[idx] = view1['img'][v]
@@ -122,7 +135,11 @@ class BasePCOptimizer (nn.Module):
 
     def state_dict(self, trainable=True):
         all_params = super().state_dict()
-        return {k: v for k, v in all_params.items() if k.startswith(('_', 'pred_i.', 'pred_j.', 'conf_i.', 'conf_j.')) != trainable}
+        return {
+            k: v
+            for k, v in all_params.items()
+            if k.startswith(('_', 'pred_i.', 'pred_j.', 'conf_i.', 'conf_j.')) != trainable
+        }
 
     def load_state_dict(self, data):
         return super().load_state_dict(self.state_dict(trainable=False) | data)
@@ -203,7 +220,7 @@ class BasePCOptimizer (nn.Module):
     def get_pts3d(self, raw=False):
         res = self.depth_to_pts3d()
         if not raw:
-            res = [dm[:h*w].view(h, w, 3) for dm, (h, w) in zip(res, self.imshapes)]
+            res = [dm[: h * w].view(h, w, 3) for dm, (h, w) in zip(res, self.imshapes)]
         return res
 
     def _set_focal(self, idx, focal, force=False):
@@ -272,15 +289,14 @@ class BasePCOptimizer (nn.Module):
             return loss, details
         return loss
 
-    @torch.cuda.amp.autocast(enabled=False)
+    @torch.amp.autocast('cuda', enabled=False)
     def compute_global_alignment(self, init=None, niter_PnP=10, **kw):
         if init is None:
             pass
         elif init == 'msp' or init == 'mst':
             init_fun.init_minimum_spanning_tree(self, niter_PnP=niter_PnP)
         elif init == 'known_poses':
-            init_fun.init_from_known_poses(self, min_conf_thr=self.min_conf_thr,
-                                           niter_PnP=niter_PnP)
+            init_fun.init_from_known_poses(self, min_conf_thr=self.min_conf_thr, niter_PnP=niter_PnP)
         else:
             raise ValueError(f'bad value for {init=}')
 
@@ -309,8 +325,9 @@ class BasePCOptimizer (nn.Module):
         im_poses = to_numpy(self.get_im_poses())
         if cam_size is None:
             cam_size = auto_cam_size(im_poses)
-        viz.add_cameras(im_poses, self.get_focals(), colors=colors,
-                        images=self.imgs, imsizes=self.imsizes, cam_size=cam_size)
+        viz.add_cameras(
+            im_poses, self.get_focals(), colors=colors, images=self.imgs, imsizes=self.imsizes, cam_size=cam_size
+        )
         if show_pw_cams:
             pw_poses = self.get_pw_poses()
             viz.add_cameras(pw_poses, color=(192, 0, 192), cam_size=cam_size)
@@ -363,13 +380,12 @@ def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, sche
     loss.backward()
     optimizer.step()
 
-    return float(loss), lr
+    return loss.item(), lr
 
 
 @torch.no_grad()
-def clean_pointcloud( im_confs, K, cams, depthmaps, all_pts3d, 
-                      tol=0.001, bad_conf=0, dbg=()):
-    """ Method: 
+def clean_pointcloud(im_confs, K, cams, depthmaps, all_pts3d, tol=0.001, bad_conf=0, dbg=()):
+    """Method:
     1) express all 3d points in each camera coordinate frame
     2) if they're in front of a depthmap --> then lower their confidence
     """
@@ -378,17 +394,18 @@ def clean_pointcloud( im_confs, K, cams, depthmaps, all_pts3d,
     res = [c.clone() for c in im_confs]
 
     # reshape appropriately
-    all_pts3d = [p.view(*c.shape,3) for p,c in zip(all_pts3d, im_confs)]
-    depthmaps = [d.view(*c.shape) for d,c in zip(depthmaps, im_confs)]
-    
+    all_pts3d = [p.view(*c.shape, 3) for p, c in zip(all_pts3d, im_confs)]
+    depthmaps = [d.view(*c.shape) for d, c in zip(depthmaps, im_confs)]
+
     for i, pts3d in enumerate(all_pts3d):
         for j in range(len(all_pts3d)):
-            if i == j: continue
+            if i == j:
+                continue
 
             # project 3dpts in other view
             proj = geotrf(cams[j], pts3d)
-            proj_depth = proj[:,:,2]
-            u,v = geotrf(K[j], proj, norm=1, ncol=2).round().long().unbind(-1)
+            proj_depth = proj[:, :, 2]
+            u, v = geotrf(K[j], proj, norm=1, ncol=2).round().long().unbind(-1)
 
             # check which points are actually in the visible cone
             H, W = im_confs[j].shape
@@ -396,7 +413,7 @@ def clean_pointcloud( im_confs, K, cams, depthmaps, all_pts3d,
             msk_j = v[msk_i], u[msk_i]
 
             # find bad points = those in front but less confident
-            bad_points = (proj_depth[msk_i] < (1-tol) * depthmaps[j][msk_j]) & (res[i][msk_i] < res[j][msk_j])
+            bad_points = (proj_depth[msk_i] < (1 - tol) * depthmaps[j][msk_j]) & (res[i][msk_i] < res[j][msk_j])
 
             bad_msk_i = msk_i.clone()
             bad_msk_i[msk_i] = bad_points
