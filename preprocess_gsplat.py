@@ -1,4 +1,5 @@
 import shutil
+import logging
 import argparse
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 import pycolmap
 import quaternion
+from plyfile import PlyData, PlyElement
 from tqdm.auto import tqdm
 
 from dust3r.model import AsymmetricCroCo3DStereo
@@ -15,6 +17,38 @@ from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
 from dust3r.utils.geometry import xy_grid, find_reciprocal_matches
+
+
+def quad2rotation(q):
+    """
+    Convert quaternion to rotation in batch. Since all operation in pytorch, support gradient passing.
+
+    Args:
+        quad (tensor, batch_size*4): quaternion.
+
+    Returns:
+        rot_mat (tensor, batch_size*3*3): rotation.
+    """
+    if not isinstance(q, torch.Tensor):
+        q = torch.tensor(q).cuda()
+
+    norm = torch.sqrt(q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3])
+    q = q / norm[:, None]
+    rot = torch.zeros((q.size(0), 3, 3)).to(q)
+    r = q[:, 0]
+    x = q[:, 1]
+    y = q[:, 2]
+    z = q[:, 3]
+    rot[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    rot[:, 0, 1] = 2 * (x * y - r * z)
+    rot[:, 0, 2] = 2 * (x * z + r * y)
+    rot[:, 1, 0] = 2 * (x * y + r * z)
+    rot[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    rot[:, 1, 2] = 2 * (y * z - r * x)
+    rot[:, 2, 0] = 2 * (x * z - r * y)
+    rot[:, 2, 1] = 2 * (y * z + r * x)
+    rot[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return rot
 
 
 def main(args: argparse.Namespace):
@@ -27,14 +61,22 @@ def main(args: argparse.Namespace):
 
     if torch.cuda.is_available():
         device = torch.device(f'cuda:{args.gpu}')
+        logging.info(f'Using CUDA device: {torch.cuda.get_device_name(args.gpu)}')
     else:
-        raise RuntimeError('CUDA is not available. Please check your setup.')
+        device = torch.device('cpu')
+        logging.warning('CUDA is not available. Continue with CPU')
 
     model_name = 'naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt'
     model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(device)
 
     # load_images can take a list of images or a directory
-    image_files = sorted(list(image_dir.glob('*.JPG')))
+    file_glob = ['.jpg', '.jpeg', '.png', '.JPG', '.PNG']
+    image_files = []
+    for f in image_dir.iterdir():
+        for e in file_glob:
+            if str(f).endswith(e):
+                image_files.append(f)
+                break
     print(f'Loading images from {image_dir} ({len(image_files)} files)')
 
     images = load_images([str(f) for f in image_files], size=args.resize)
@@ -49,58 +91,106 @@ def main(args: argparse.Namespace):
     # retrieve useful values from scene:
     scene = scene.clean_pointcloud()
     imgs = scene.imgs
-    focals = scene.get_focals()
     poses = scene.get_im_poses()
     pts3d = scene.get_pts3d()
+
+    min_conf_thr = np.exp(args.conf_threshold)
+    scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
+    print(f'scene.min_conf_thr = {scene.min_conf_thr}')
+
+    intrinsics = scene.get_intrinsics()
     confidence_masks = scene.get_masks()
 
+    poses = [t.detach().cpu().numpy() for t in poses]
+    pts3d = [t.detach().cpu().numpy() for t in pts3d]
+    intrinsics = [t.detach().cpu().numpy() for t in intrinsics]
+    confidence_masks = [t.detach().cpu().numpy() for t in confidence_masks]
+
     # Calculate image scaling factor
-    org_image = cv2.imread(image_files[0], cv2.IMREAD_GRAYSCALE)
-    H, W = org_image.shape[:2]
-    h, w = imgs[0].shape[:2]
-    scale = min(H / h, W / w)
+    org_image = cv2.imread(str(image_files[0]), cv2.IMREAD_GRAYSCALE)
+    org_height, org_width = org_image.shape[:2]
+    height, width = imgs[0].shape[:2]
+    scale = min(org_height / height, org_width / width)
 
     # Save COLMAP cameras
     cam_txt = sparse_dir / 'cameras.txt'
-    avg_focal = np.mean(focals.detach().cpu().numpy())
     with open(cam_txt, mode='w') as f:
-        f.write(f'1 PINHOLE {W:d} {H:d} {avg_focal * scale:f} {W / 2:f} {H / 2:f}\n')
+        if args.single_cam:
+            K = np.mean(intrinsics, axis=0)
+            px = org_width * 0.5
+            py = org_height * 0.5
+            fx = px / K[0, 2] * K[0, 0]
+            fy = py / K[1, 2] * K[1, 1]
+            f.write(f'1 PINHOLE {org_width:d} {org_height:d} {fx:f} {fy:f} {px:f} {py:f}\n')
+        else:
+            for i in tqdm(range(len(intrinsics)), desc='Saving COLMAP cameras'):
+                K = intrinsics[i]
+                px = org_width * 0.5
+                py = org_height * 0.5
+                fx = px / K[0, 2] * K[0, 0]
+                fy = py / K[1, 2] * K[1, 1]
+
+                # CAMERA_ID, TYPE, WIDTH, HEIGHT, FX, FY, PX, PY (for PINHOLE)
+                f.write(f'{i + 1:d} PINHOLE {org_width:d} {org_height:d} {fx:f} {fy:f} {px:f} {py:f}\n')
 
     # Save COLMAP images
     img_txt = sparse_dir / 'images.txt'
-    global_point_id = 1
     with open(img_txt, mode='w') as f:
-        for i in tqdm(range(len(imgs))):
-            pose = poses[i].detach().cpu().numpy()
+        for i in tqdm(range(len(imgs)), desc='Saving COLMAP images'):
+            pose = poses[i]
             tv = pose[:3, 3]
             qv = quaternion.from_rotation_matrix(pose[:3, :3])
             name = image_files[i].name
-            f.write(f'{i + 1:d} {qv.w:f} {qv.x:f} {qv.y:f} {qv.z:f} {tv[0]:f} {tv[1]:f} {tv[2]:f} 1 {name:s}\n')
-
-            conf_i = confidence_masks[i].detach().cpu().numpy()
-            H, W = imgs[i].shape[:2]
-            pts2d = xy_grid(W, H)[conf_i]
-            pts2d_txt = [f'{p[0]} {p[1]} {k + global_point_id}' for k, p in enumerate(pts2d)]
-            f.write(' '.join(pts2d_txt) + '\n')
-
-            global_point_id += len(pts2d)
+            cam_id = 1 if args.single_cam else i + 1
+            f.write(
+                f'{i + 1:d} {qv.w:f} {qv.x:f} {qv.y:f} {qv.z:f} {tv[0]:f} {tv[1]:f} {tv[2]:f} {cam_id:d} {name:s}\n'
+            )
+            f.write('\n')  # every 2nd line is for the point data, not needed for GSplats.
 
     # Save COLMAP points
     pts_txt = sparse_dir / 'points3D.txt'
-    global_point_id = 1
+    point_id = 1
+    points = []
+    colors = []
     with open(pts_txt, mode='w') as f:
-        for i in tqdm(range(len(pts3d))):
-            pts = pts3d[i].reshape((-1, 3))
-            rgb = imgs[i].reshape((-1, 3))
+        for i in tqdm(range(len(pts3d)), desc='Saving COLMAP points'):
+            conf_i = confidence_masks[i]
+            pts = pts3d[i][conf_i]
+            rgb = imgs[i][conf_i]
             rgb = (rgb * 255.0).astype(np.uint8)
             err = 0.0
-            for k, p in enumerate(pts):
-                pid = k + global_point_id
-                f.write(
-                    f'{pid} {p[0]} {p[1]} {p[2]} 1 {rgb[k, 0]:d} {rgb[k, 1]:d} {rgb[k, 2]:d} {err:f} {i + 1:d} {k:d}\n'
-                )
+            for j, p in enumerate(pts):
+                # POINT_ID, X, Y, Z, R, G, B, ERR
+                f.write(f'{point_id:d} {p[0]} {p[1]} {p[2]} {rgb[j, 0]:d} {rgb[j, 1]:d} {rgb[j, 2]:d} {err:f}\n')
+                point_id += 1
 
-            global_point_id += len(pts)
+            points.append(pts)
+            colors.append(rgb)
+
+    points = np.concatenate(points, axis=0).astype(np.float32)
+    normals = np.zeros_like(points)
+    colors = np.concatenate(colors, axis=0).astype(np.uint8)
+    print(f'Total {len(points)} are detected!')
+
+    # Save PLY
+    point_data = [(x, y, z, nx, ny, nz, r, g, b) for (x, y, z), (nx, ny, nz), (r, g, b) in zip(points, normals, colors)]
+    point_data = np.array(
+        point_data,
+        dtype=[
+            ('x', 'f4'),
+            ('y', 'f4'),
+            ('z', 'f4'),
+            ('nx', 'f4'),
+            ('ny', 'f4'),
+            ('nz', 'f4'),
+            ('red', 'u1'),
+            ('green', 'u1'),
+            ('blue', 'u1'),
+        ],
+    )
+    elements = PlyElement.describe(point_data, 'vertex')
+    ply_data = PlyData([elements], text=False, byte_order='<')
+    ply_data.write(sparse_dir / 'points3D.ply')
 
     # Copy images
     out_image_dir = out_dir / 'images'
@@ -145,7 +235,7 @@ def main(args: argparse.Namespace):
     database = pycolmap.Database()
     database.open(str(database_path))
     for i, image_id in enumerate(image_ids):
-        conf_i = confidence_masks[i].cpu().numpy()
+        conf_i = confidence_masks[i]
         H, W = imgs[i].shape[:2]
         keypoints = np.array(xy_grid(W, H)[conf_i], dtype=np.float64)
         keypoints = (keypoints + 0.5) * scale  # COLMAP origin
@@ -159,7 +249,7 @@ def main(args: argparse.Namespace):
     skip_geometric_verification = True
 
     matched: set[tuple[int, int]] = set()
-    for pair in tqdm(pairs):
+    for pair in tqdm(pairs, desc='Exporting matches for COLMAP database'):
         id0 = pair[0]['idx']
         id1 = pair[1]['idx']
         if (id0, id1) in matched or (id1, id0) in matched:
@@ -169,10 +259,10 @@ def main(args: argparse.Namespace):
 
         pts2d_list, pts3d_list = [], []
         for i in [id0, id1]:
-            conf_i = confidence_masks[i].cpu().numpy()
+            conf_i = confidence_masks[i]
             H, W = imgs[i].shape[:2]
             pts2d_list.append(xy_grid(W, H)[conf_i])
-            pts3d_list.append(pts3d[i].detach().cpu().numpy()[conf_i])
+            pts3d_list.append(pts3d[i][conf_i])
 
         reciprocal_in_P2, nn2_in_P1, num_matches = find_reciprocal_matches(pts3d_list[0], pts3d_list[1])
 
@@ -180,7 +270,7 @@ def main(args: argparse.Namespace):
         matches1 = np.arange(len(pts2d_list[1]))[reciprocal_in_P2]
 
         matches = np.stack([matches1, matches0], axis=1).astype(np.int32)
-        print(f'found {len(matches)} matches ({id0} vs {id1})')
+        # print(f'found {num_matches} matches ({id0} vs {id1})')
 
         database.write_matches(image_ids[id0], image_ids[id1], matches.tolist())
         if skip_geometric_verification:
@@ -196,10 +286,12 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--input', type=str, required=True)
     parser.add_argument('-r', '--resize', type=int, default=512)
     parser.add_argument('--gpu', type=int, default=0, help='Device to run the model on')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for inference')
     parser.add_argument('--schedule', type=str, default='cosine', help='Learning rate schedule')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
-    parser.add_argument('--niter', type=int, default=300, help='Number of iterations')
+    parser.add_argument('--niter', type=int, default=500, help='Number of iterations')
+    parser.add_argument('--conf_threshold', type=float, default=1.0, help='Confidence threshold')
+    parser.add_argument('--single_cam', action='store_true', help='Use single camera mode')
 
     args = parser.parse_args()
     main(args)

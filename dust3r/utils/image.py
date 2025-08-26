@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import PIL.Image
 import torchvision.transforms as tvf
+from PIL.Image import Image as PILImage
 from PIL.ImageOps import exif_transpose
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
@@ -63,12 +64,13 @@ def rgb(ftensor, true_shape=None):
     return img.clip(min=0, max=1)
 
 
-def _resize_pil_image(img, long_edge_size):
+def _resize_pil_image(img: PILImage, long_edge_size: int) -> PILImage:
     S = max(img.size)
     if S > long_edge_size:
         interp = PIL.Image.LANCZOS
     elif S <= long_edge_size:
         interp = PIL.Image.BICUBIC
+
     new_size = tuple(int(round(x * long_edge_size / S)) for x in img.size)
     return img.resize(new_size, interp)
 
@@ -97,6 +99,7 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, patch_size=
     for path in folder_content:
         if not path.lower().endswith(supported_images_extensions):
             continue
+
         img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
         W1, H1 = img.size
         if size == 224:
@@ -105,6 +108,7 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, patch_size=
         else:
             # resize long side to 512
             img = _resize_pil_image(img, size)
+
         W, H = img.size
         cx, cy = W // 2, H // 2
         if size == 224:
@@ -120,11 +124,18 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, patch_size=
         W2, H2 = img.size
         if verbose:
             print(f' - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}')
+
         imgs.append(
-            dict(img=ImgNorm(img)[None], true_shape=np.int32([img.size[::-1]]), idx=len(imgs), instance=str(len(imgs)))
+            dict(
+                img=ImgNorm(img)[None],
+                true_shape=np.int32([img.size[::-1]]),
+                idx=len(imgs),
+                instance=str(len(imgs)),
+            )
         )
 
     assert imgs, 'no images foud at ' + root
     if verbose:
         print(f' (Found {len(imgs)} images)')
+
     return imgs
