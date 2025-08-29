@@ -8,33 +8,41 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from dust3r.cloud_opt.base_opt import BasePCOptimizer
-from dust3r.utils.geometry import xy_grid, geotrf
 from dust3r.utils.device import to_cpu, to_numpy
+from dust3r.utils.geometry import geotrf, xy_grid
+from dust3r.cloud_opt.base_opt import BasePCOptimizer
 
 
 class PointCloudOptimizer(BasePCOptimizer):
-    """ Optimize a global scene, given a list of pairwise observations.
+    """Optimize a global scene, given a list of pairwise observations.
     Graph node: images
     Graph edges: observations = (pred1, pred2)
     """
 
-    def __init__(self, *args, optimize_pp=False, focal_break=20, **kwargs):
+    def __init__(self, *args, optimize_pp=False, focal_break=20, shared_focal=False, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.has_im_poses = True  # by definition of this class
+        self.optimize_pp = optimize_pp
         self.focal_break = focal_break
+        self.shared_focal = shared_focal
 
         # adding thing to optimize
-        self.im_depthmaps = nn.ParameterList(torch.randn(H, W)/10-3 for H, W in self.imshapes)  # log(depth)
+        self.im_depthmaps = nn.ParameterList(torch.randn(H, W) / 10 - 3 for H, W in self.imshapes)  # log(depth)
         self.im_poses = nn.ParameterList(self.rand_pose(self.POSE_DIM) for _ in range(self.n_imgs))  # camera poses
-        self.im_focals = nn.ParameterList(torch.FloatTensor(
-            [self.focal_break*np.log(max(H, W))]) for H, W in self.imshapes)  # camera intrinsics
+        if self.shared_focal:
+            self.im_focals = nn.ParameterList(
+                torch.FloatTensor([self.focal_break * np.log(max(H, W))]) for H, W in self.imshapes[:1]
+            )  # camera intrinsics
+        else:
+            self.im_focals = nn.ParameterList(
+                torch.FloatTensor([self.focal_break * np.log(max(H, W))]) for H, W in self.imshapes
+            )  # camera intrinsics
         self.im_pp = nn.ParameterList(torch.zeros((2,)) for _ in range(self.n_imgs))  # camera intrinsics
         self.im_pp.requires_grad_(optimize_pp)
 
         self.imshape = self.imshapes[0]
-        im_areas = [h*w for h, w in self.imshapes]
+        im_areas = [h * w for h, w in self.imshapes]
         self.max_area = max(im_areas)
 
         # adding thing to optimize
@@ -42,15 +50,18 @@ class PointCloudOptimizer(BasePCOptimizer):
         self.im_poses = ParameterStack(self.im_poses, is_param=True)
         self.im_focals = ParameterStack(self.im_focals, is_param=True)
         self.im_pp = ParameterStack(self.im_pp, is_param=True)
-        self.register_buffer('_pp', torch.tensor([(w/2, h/2) for h, w in self.imshapes]))
-        self.register_buffer('_grid', ParameterStack(
-            [xy_grid(W, H, device=self.device) for H, W in self.imshapes], fill=self.max_area))
+        self.register_buffer('_pp', torch.tensor([(w / 2, h / 2) for h, w in self.imshapes]))
+        self.register_buffer(
+            '_grid', ParameterStack([xy_grid(W, H, device=self.device) for H, W in self.imshapes], fill=self.max_area)
+        )
 
         # pre-compute pixel weights
-        self.register_buffer('_weight_i', ParameterStack(
-            [self.conf_trf(self.conf_i[i_j]) for i_j in self.str_edges], fill=self.max_area))
-        self.register_buffer('_weight_j', ParameterStack(
-            [self.conf_trf(self.conf_j[i_j]) for i_j in self.str_edges], fill=self.max_area))
+        self.register_buffer(
+            '_weight_i', ParameterStack([self.conf_trf(self.conf_i[i_j]) for i_j in self.str_edges], fill=self.max_area)
+        )
+        self.register_buffer(
+            '_weight_j', ParameterStack([self.conf_trf(self.conf_j[i_j]) for i_j in self.str_edges], fill=self.max_area)
+        )
 
         # precompute aa
         self.register_buffer('_stacked_pred_i', ParameterStack(self.pred_i, self.str_edges, fill=self.max_area))
@@ -70,12 +81,12 @@ class PointCloudOptimizer(BasePCOptimizer):
             known_poses = [known_poses]
         for idx, pose in zip(self._get_msk_indices(pose_msk), known_poses):
             if self.verbose:
-                print(f' (setting pose #{idx} = {pose[:3,3]})')
+                print(f' (setting pose #{idx} = {pose[:3, 3]})')
             self._no_grad(self._set_pose(self.im_poses, idx, torch.tensor(pose)))
 
         # normalize scale if there's less than 1 known pose
         n_known_poses = sum((p.requires_grad is False) for p in self.im_poses)
-        self.norm_pw_scale = (n_known_poses <= 1)
+        self.norm_pw_scale = n_known_poses <= 1
 
         self.im_poses.requires_grad_(False)
         self.norm_pw_scale = False
@@ -125,7 +136,10 @@ class PointCloudOptimizer(BasePCOptimizer):
         return param
 
     def get_focals(self):
-        log_focals = torch.stack(list(self.im_focals), dim=0)
+        if self.shared_focal:
+            log_focals = torch.stack([self.im_focals[0]] * self.n_imgs, dim=0)
+        else:
+            log_focals = torch.stack(list(self.im_focals), dim=0)
         return (log_focals / self.focal_break).exp()
 
     def get_known_focal_mask(self):
@@ -135,7 +149,7 @@ class PointCloudOptimizer(BasePCOptimizer):
         param = self.im_pp[idx]
         H, W = self.imshapes[idx]
         if param.requires_grad or force:  # can only init a parameter not already initialized
-            param.data[:] = to_cpu(to_numpy(pp) - (W/2, H/2)) / 10
+            param.data[:] = to_cpu(to_numpy(pp) - (W / 2, H / 2)) / 10
         return param
 
     def get_principal_points(self):
@@ -164,7 +178,7 @@ class PointCloudOptimizer(BasePCOptimizer):
     def get_depthmaps(self, raw=False):
         res = self.im_depthmaps.exp()
         if not raw:
-            res = [dm[:h*w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
+            res = [dm[: h * w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
         return res
 
     def depth_to_pts3d(self):
@@ -182,7 +196,7 @@ class PointCloudOptimizer(BasePCOptimizer):
     def get_pts3d(self, raw=False):
         res = self.depth_to_pts3d()
         if not raw:
-            res = [dm[:h*w].view(h, w, 3) for dm, (h, w) in zip(res, self.imshapes)]
+            res = [dm[: h * w].view(h, w, 3) for dm, (h, w) in zip(res, self.imshapes)]
         return res
 
     def forward(self):
@@ -233,13 +247,13 @@ def _ravel_hw(tensor, fill=0):
     tensor = tensor.view((tensor.shape[0] * tensor.shape[1],) + tensor.shape[2:])
 
     if len(tensor) < fill:
-        tensor = torch.cat((tensor, tensor.new_zeros((fill - len(tensor),)+tensor.shape[1:])))
+        tensor = torch.cat((tensor, tensor.new_zeros((fill - len(tensor),) + tensor.shape[1:])))
     return tensor
 
 
 def acceptable_focal_range(H, W, minf=0.5, maxf=3.5):
     focal_base = max(H, W) / (2 * np.tan(np.deg2rad(60) / 2))  # size / 1.1547005383792515
-    return minf*focal_base, maxf*focal_base
+    return minf * focal_base, maxf * focal_base
 
 
 def apply_mask(img, msk):

@@ -124,10 +124,15 @@ def init_from_pts3d(self, pts3d, im_focals, im_poses):
             self._set_depthmap(i, depth)
             self._set_pose(self.im_poses, i, cam2world)
             if im_focals[i] is not None:
-                self._set_focal(i, im_focals[i])
+                if not self.shared_focal:
+                    self._set_focal(i, im_focals[i])
+
+        if self.shared_focal:
+            self._set_focal(0, sum(im_focals) / self.n_imgs)
 
     if self.verbose:
-        print(f' init loss = {self().item():.6f}')
+        with torch.no_grad():
+            print(f' init loss = {self().item():.6f}')
 
 
 def minimum_spanning_tree(

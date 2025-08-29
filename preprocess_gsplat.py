@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import trimesh
 import pycolmap
 import quaternion
 from plyfile import PlyData, PlyElement
@@ -19,36 +20,55 @@ from dust3r.utils.image import load_images
 from dust3r.utils.geometry import xy_grid, find_reciprocal_matches
 
 
-def quad2rotation(q):
+def compute_frustum(K, z_far=0.5):
+    fx, fy = K[0, 0], K[1, 1]
+    px, py = K[0, 2], K[1, 2]
+    width, height = px * 2, py * 2
+
+    corners = np.array([[0, 0], [0, height], [width, height], [width, 0]], dtype=np.float32)
+    frustum = [[0.0, 0.0, 0.0, 1.0]]
+    for x, y in corners:
+        xc = (x - px) * z_far / fx
+        yc = (y - py) * z_far / fy
+        frustum.append([xc, yc, z_far, 1.0])
+
+    return np.array(frustum, dtype=np.float32)
+
+
+def export_gltf(intrinsics, extrinsics, points, colors, glb_file: Path):
     """
-    Convert quaternion to rotation in batch. Since all operation in pytorch, support gradient passing.
-
-    Args:
-        quad (tensor, batch_size*4): quaternion.
-
-    Returns:
-        rot_mat (tensor, batch_size*3*3): rotation.
+    Convert a PLY file to GLB format.
     """
-    if not isinstance(q, torch.Tensor):
-        q = torch.tensor(q).cuda()
+    scene = trimesh.Scene()
 
-    norm = torch.sqrt(q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3])
-    q = q / norm[:, None]
-    rot = torch.zeros((q.size(0), 3, 3)).to(q)
-    r = q[:, 0]
-    x = q[:, 1]
-    y = q[:, 2]
-    z = q[:, 3]
-    rot[:, 0, 0] = 1 - 2 * (y * y + z * z)
-    rot[:, 0, 1] = 2 * (x * y - r * z)
-    rot[:, 0, 2] = 2 * (x * z + r * y)
-    rot[:, 1, 0] = 2 * (x * y + r * z)
-    rot[:, 1, 1] = 1 - 2 * (x * x + z * z)
-    rot[:, 1, 2] = 2 * (y * z - r * x)
-    rot[:, 2, 0] = 2 * (x * z - r * y)
-    rot[:, 2, 1] = 2 * (y * z + r * x)
-    rot[:, 2, 2] = 1 - 2 * (x * x + y * y)
-    return rot
+    # Point cloud
+    pcd = trimesh.PointCloud(points, colors=colors)
+    scene.add_geometry([pcd], geom_name='Point Cloud')
+
+    scene_scale = np.max(np.std(points, axis=0))
+
+    # Camera frustums
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 4, 1],
+            [1, 3, 2],
+            [1, 4, 3],
+        ],
+        dtype=np.int32,
+    )
+
+    for idx, (K, P) in enumerate(zip(intrinsics, extrinsics)):
+        v_view = compute_frustum(K, z_far=0.05 * scene_scale)
+        v_world = (P @ v_view.T).T[:, :3]
+        vertex_colors = np.array([255, 0, 0] * len(v_world), dtype=np.uint8).reshape((-1, 3))
+        frustum = trimesh.Trimesh(vertices=v_world, faces=faces, vertex_colors=vertex_colors, process=False)
+        scene.add_geometry([frustum], geom_name=f'Camera #{idx + 1:d}')
+
+    # Save glTF (binary)
+    scene.export(str(glb_file), file_type='glb')
 
 
 def main(args: argparse.Namespace):
@@ -80,11 +100,17 @@ def main(args: argparse.Namespace):
     print(f'Loading images from {image_dir} ({len(image_files)} files)')
 
     images = load_images([str(f) for f in image_files], size=args.resize)
-    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=False)
+    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     output = inference(pairs, model, device, batch_size=args.batch_size)
 
     # Global alignment
-    scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
+    scene = global_aligner(
+        output,
+        device=device,
+        mode=GlobalAlignerMode.PointCloudOptimizer,
+        shared_focal=args.single_camera,
+    )
+
     loss = scene.compute_global_alignment(init='mst', niter=args.niter, schedule=args.schedule, lr=args.lr)
     print(f'Global alignment loss: {loss:.4f}')
 
@@ -94,8 +120,7 @@ def main(args: argparse.Namespace):
     poses = scene.get_im_poses()
     pts3d = scene.get_pts3d()
 
-    min_conf_thr = np.exp(args.conf_threshold)
-    scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
+    scene.min_conf_thr = float(scene.conf_trf(torch.tensor(args.conf_threshold)))
     print(f'scene.min_conf_thr = {scene.min_conf_thr}')
 
     intrinsics = scene.get_intrinsics()
@@ -115,7 +140,7 @@ def main(args: argparse.Namespace):
     # Save COLMAP cameras
     cam_txt = sparse_dir / 'cameras.txt'
     with open(cam_txt, mode='w') as f:
-        if args.single_cam:
+        if args.single_camera:
             K = np.mean(intrinsics, axis=0)
             px = org_width * 0.5
             py = org_height * 0.5
@@ -141,7 +166,7 @@ def main(args: argparse.Namespace):
             tv = pose[:3, 3]
             qv = quaternion.from_rotation_matrix(pose[:3, :3])
             name = image_files[i].name
-            cam_id = 1 if args.single_cam else i + 1
+            cam_id = 1 if args.single_camera else i + 1
             f.write(
                 f'{i + 1:d} {qv.w:f} {qv.x:f} {qv.y:f} {qv.z:f} {tv[0]:f} {tv[1]:f} {tv[2]:f} {cam_id:d} {name:s}\n'
             )
@@ -199,86 +224,91 @@ def main(args: argparse.Namespace):
     for f in tqdm(image_files):
         shutil.copy(f, out_image_dir / f.name)
 
-    # Delete old database file if exists
-    database_path = out_dir / 'database.db'
-    if database_path.exists():
-        database_path.unlink()
+    # Save glTF file for sanity check
+    export_gltf(intrinsics, poses, points, colors, sparse_dir / 'points3D.glb')
 
-    # Create an empty database
-    database = pycolmap.Database()
-    database.open(str(database_path))
-    database.close()
+    # Save COLMAP database, if requested
+    if args.save_db:
+        # Delete old database file if exists
+        database_path = out_dir / 'database.db'
+        if database_path.exists():
+            database_path.unlink()
 
-    # Import images
-    camera_mode = pycolmap.CameraMode.SINGLE
-    options = pycolmap.ImageReaderOptions()
-    image_names = [f.name for f in image_files]
-    with pycolmap.ostream():
-        pycolmap.import_images(
-            str(database_path),
-            str(image_dir),
-            camera_mode,
-            image_names,
-            options,
-        )
+        # Create an empty database
+        database = pycolmap.Database()
+        database.open(str(database_path))
+        database.close()
 
-    # Retrieve image ids
-    database = pycolmap.Database()
-    database.open(str(database_path))
-    image_ids = []
-    for img in database.read_all_images():
-        image_ids.append(img.image_id)
+        # Import images
+        camera_mode = pycolmap.CameraMode.SINGLE
+        options = pycolmap.ImageReaderOptions()
+        image_names = [f.name for f in image_files]
+        with pycolmap.ostream():
+            pycolmap.import_images(
+                str(database_path),
+                str(image_dir),
+                camera_mode,
+                image_names,
+                options,
+            )
 
-    database.close()
+        # Retrieve image ids
+        database = pycolmap.Database()
+        database.open(str(database_path))
+        image_ids = []
+        for img in database.read_all_images():
+            image_ids.append(img.image_id)
 
-    # Import features
-    database = pycolmap.Database()
-    database.open(str(database_path))
-    for i, image_id in enumerate(image_ids):
-        conf_i = confidence_masks[i]
-        H, W = imgs[i].shape[:2]
-        keypoints = np.array(xy_grid(W, H)[conf_i], dtype=np.float64)
-        keypoints = (keypoints + 0.5) * scale  # COLMAP origin
-        database.write_keypoints(image_id, keypoints)
+        database.close()
 
-    database.close()
-
-    # Import matches
-    database = pycolmap.Database()
-    database.open(str(database_path))
-    skip_geometric_verification = True
-
-    matched: set[tuple[int, int]] = set()
-    for pair in tqdm(pairs, desc='Exporting matches for COLMAP database'):
-        id0 = pair[0]['idx']
-        id1 = pair[1]['idx']
-        if (id0, id1) in matched or (id1, id0) in matched:
-            continue
-
-        matched = matched.union({(id0, id1), (id1, id0)})
-
-        pts2d_list, pts3d_list = [], []
-        for i in [id0, id1]:
+        # Import features
+        database = pycolmap.Database()
+        database.open(str(database_path))
+        for i, image_id in enumerate(image_ids):
             conf_i = confidence_masks[i]
             H, W = imgs[i].shape[:2]
-            pts2d_list.append(xy_grid(W, H)[conf_i])
-            pts3d_list.append(pts3d[i][conf_i])
+            keypoints = np.array(xy_grid(W, H)[conf_i], dtype=np.float64)
+            keypoints = (keypoints + 0.5) * scale  # COLMAP origin
+            database.write_keypoints(image_id, keypoints)
 
-        reciprocal_in_P2, nn2_in_P1, num_matches = find_reciprocal_matches(pts3d_list[0], pts3d_list[1])
+        database.close()
 
-        matches0 = np.arange(len(pts2d_list[0]))[nn2_in_P1][reciprocal_in_P2]
-        matches1 = np.arange(len(pts2d_list[1]))[reciprocal_in_P2]
+        # Import matches
+        database = pycolmap.Database()
+        database.open(str(database_path))
+        skip_geometric_verification = True
 
-        matches = np.stack([matches1, matches0], axis=1).astype(np.int32)
-        # print(f'found {num_matches} matches ({id0} vs {id1})')
+        matched: set[tuple[int, int]] = set()
+        for pair in tqdm(pairs, desc='Exporting matches for COLMAP database'):
+            id0 = pair[0]['idx']
+            id1 = pair[1]['idx']
+            if (id0, id1) in matched or (id1, id0) in matched:
+                continue
 
-        database.write_matches(image_ids[id0], image_ids[id1], matches.tolist())
-        if skip_geometric_verification:
-            two_view_geo = pycolmap.TwoViewGeometry()
-            two_view_geo.inlier_matches = matches.tolist()
-            database.write_two_view_geometry(image_ids[id1], image_ids[id0], two_view_geo)
+            matched = matched.union({(id0, id1), (id1, id0)})
 
-    database.close()
+            pts2d_list, pts3d_list = [], []
+            for i in [id0, id1]:
+                conf_i = confidence_masks[i]
+                H, W = imgs[i].shape[:2]
+                pts2d_list.append(xy_grid(W, H)[conf_i])
+                pts3d_list.append(pts3d[i][conf_i])
+
+            reciprocal_in_P2, nn2_in_P1, num_matches = find_reciprocal_matches(pts3d_list[0], pts3d_list[1])
+
+            matches0 = np.arange(len(pts2d_list[0]))[nn2_in_P1][reciprocal_in_P2]
+            matches1 = np.arange(len(pts2d_list[1]))[reciprocal_in_P2]
+
+            matches = np.stack([matches1, matches0], axis=1).astype(np.int32)
+            # print(f'found {num_matches} matches ({id0} vs {id1})')
+
+            database.write_matches(image_ids[id0], image_ids[id1], matches.tolist())
+            if skip_geometric_verification:
+                two_view_geo = pycolmap.TwoViewGeometry()
+                two_view_geo.inlier_matches = matches.tolist()
+                database.write_two_view_geometry(image_ids[id1], image_ids[id0], two_view_geo)
+
+        database.close()
 
 
 if __name__ == '__main__':
@@ -286,12 +316,19 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--input', type=str, required=True)
     parser.add_argument('-r', '--resize', type=int, default=512)
     parser.add_argument('--gpu', type=int, default=0, help='Device to run the model on')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for inference')
-    parser.add_argument('--schedule', type=str, default='cosine', help='Learning rate schedule')
-    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
-    parser.add_argument('--niter', type=int, default=500, help='Number of iterations')
-    parser.add_argument('--conf_threshold', type=float, default=1.0, help='Confidence threshold')
-    parser.add_argument('--single_cam', action='store_true', help='Use single camera mode')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for inference')
+    parser.add_argument(
+        '--schedule',
+        type=str,
+        default='cosine',
+        choices=['linear', 'cosine'],
+        help='Learning rate schedule',
+    )
+    parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
+    parser.add_argument('--niter', type=int, default=1000, help='Number of iterations')
+    parser.add_argument('--conf_threshold', type=float, default=3.0, help='Confidence threshold')
+    parser.add_argument('--single_camera', action='store_true', help='Use single camera mode')
+    parser.add_argument('--save_db', action='store_true', help='Save COLMAP database.db')
 
     args = parser.parse_args()
     main(args)

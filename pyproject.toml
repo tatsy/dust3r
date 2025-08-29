@@ -32,7 +32,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["ruff>=0.12.9"]
+dev = [
+    "flake8-pyproject>=1.2.3",
+    "ruff>=0.12.9",
+]
 
 [tool.uv.sources]
 torch = [
@@ -84,7 +87,6 @@ unfixable = []
 length-sort = true
 length-sort-straight = true
 
-
 [tool.mypy]
 python_version = "3.11"
 follow_imports = "silent"
@@ -93,3 +95,7 @@ disallow_any_generics = true
 strict_optional = true
 check_untyped_defs = true
 allow_redefinition = true
+
+[tool.flake8]
+max-line-length = 120
+ignore = "Q000,E127,E203,E402,W503,W504"
