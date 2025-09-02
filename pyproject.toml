@@ -1,8 +1,10 @@
 [project]
 name = "dust3r"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "DUSt3R: Geometric 3D Vision Made Easy"
 readme = "README.md"
+license = "CC BY-NC-SA 4.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
   "einops>=0.8.1",
