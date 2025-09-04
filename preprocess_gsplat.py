@@ -85,7 +85,7 @@ def filter_known_cameras_and_images(image_files: list[Path], known_cameras, know
     return filtered_cameras, filtered_images
 
 
-def extract_known_poses_and_focals_with_mask(filtered_images, filtered_cameras, image_files: list[Path]):
+def extract_known_poses_and_focals(filtered_images, filtered_cameras, image_files: list[Path]):
     known_poses = []
     known_focals = []
     pose_mask = []
@@ -167,10 +167,8 @@ def main(args: argparse.Namespace):
         known_cameras = read_intrinsics_binary(colmap_sparse_path / 'cameras.bin')
         known_images = read_extrinsics_binary(colmap_sparse_path / 'images.bin')
 
-        filtered_cameras, filtered_images = filter_known_cameras_and_images(image_files, known_cameras, known_images)
-        known_poses, known_focals, pose_mask = extract_known_poses_and_focals_with_mask(
-            filtered_images, filtered_cameras, image_files
-        )
+        known_cameras, known_images = filter_known_cameras_and_images(image_files, known_cameras, known_images)
+        known_poses, known_focals, pose_mask = extract_known_poses_and_focals(known_images, known_cameras, image_files)
         known_focals = [focal / scale for focal in known_focals]
 
         assert isinstance(scene, PointCloudOptimizer)
@@ -302,8 +300,8 @@ if __name__ == '__main__':
         choices=['linear', 'cosine'],
         help='Learning rate schedule',
     )
-    parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
-    parser.add_argument('--niter', type=int, default=1000, help='Number of iterations')
+    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
+    parser.add_argument('--niter', type=int, default=500, help='Number of iterations')
     parser.add_argument('--min_conf_thr', type=float, default=1.0, help='Confidence threshold')
     parser.add_argument('--single_camera', action='store_true', help='Use single camera mode')
     parser.add_argument('--preset_pose', action='store_true', help='Use preset poses from COLMAP')
