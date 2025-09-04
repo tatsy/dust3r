@@ -74,15 +74,19 @@ class PointCloudOptimizer(BasePCOptimizer):
     def _check_all_imgs_are_selected(self, msk):
         assert np.all(self._get_msk_indices(msk) == np.arange(self.n_imgs)), 'incomplete mask!'
 
-    def preset_pose(self, known_poses, pose_msk=None):  # cam-to-world
-        self._check_all_imgs_are_selected(pose_msk)
+    def preset_pose(self, known_poses, pose_mask=None):  # cam-to-world
+        self._check_all_imgs_are_selected(pose_mask)
 
         if isinstance(known_poses, torch.Tensor) and known_poses.ndim == 2:
             known_poses = [known_poses]
-        for idx, pose in zip(self._get_msk_indices(pose_msk), known_poses):
+        for idx, pose in zip(self._get_msk_indices(pose_mask), known_poses):
             if self.verbose:
                 print(f' (setting pose #{idx} = {pose[:3, 3]})')
-            self._no_grad(self._set_pose(self.im_poses, idx, torch.tensor(pose)))
+
+            if isinstance(pose, np.ndarray):
+                pose = torch.Tensor(pose)
+
+            self._no_grad(self._set_pose(self.im_poses, idx, pose.clone().detach()))
 
         # normalize scale if there's less than 1 known pose
         n_known_poses = sum((p.requires_grad is False) for p in self.im_poses)
@@ -91,40 +95,40 @@ class PointCloudOptimizer(BasePCOptimizer):
         self.im_poses.requires_grad_(False)
         self.norm_pw_scale = False
 
-    def preset_focal(self, known_focals, msk=None):
-        self._check_all_imgs_are_selected(msk)
+    def preset_focal(self, known_focals, mask=None):
+        self._check_all_imgs_are_selected(mask)
 
-        for idx, focal in zip(self._get_msk_indices(msk), known_focals):
+        for idx, focal in zip(self._get_msk_indices(mask), known_focals):
             if self.verbose:
                 print(f' (setting focal #{idx} = {focal})')
             self._no_grad(self._set_focal(idx, focal))
 
         self.im_focals.requires_grad_(False)
 
-    def preset_principal_point(self, known_pp, msk=None):
-        self._check_all_imgs_are_selected(msk)
+    def preset_principal_point(self, known_pp, mask=None):
+        self._check_all_imgs_are_selected(mask)
 
-        for idx, pp in zip(self._get_msk_indices(msk), known_pp):
+        for idx, pp in zip(self._get_msk_indices(mask), known_pp):
             if self.verbose:
                 print(f' (setting principal point #{idx} = {pp})')
             self._no_grad(self._set_principal_point(idx, pp))
 
         self.im_pp.requires_grad_(False)
 
-    def _get_msk_indices(self, msk):
-        if msk is None:
+    def _get_msk_indices(self, mask):
+        if mask is None:
             return range(self.n_imgs)
-        elif isinstance(msk, int):
-            return [msk]
-        elif isinstance(msk, (tuple, list)):
-            return self._get_msk_indices(np.array(msk))
-        elif msk.dtype in (bool, torch.bool, np.bool_):
-            assert len(msk) == self.n_imgs
-            return np.where(msk)[0]
-        elif np.issubdtype(msk.dtype, np.integer):
-            return msk
+        elif isinstance(mask, int):
+            return [mask]
+        elif isinstance(mask, (tuple, list)):
+            return self._get_msk_indices(np.array(mask))
+        elif mask.dtype in (bool, torch.bool, np.bool_):
+            assert len(mask) == self.n_imgs
+            return np.where(mask)[0]
+        elif np.issubdtype(mask.dtype, np.integer):
+            return mask
         else:
-            raise ValueError(f'bad {msk=}')
+            raise ValueError(f'bad {mask=}')
 
     def _no_grad(self, tensor):
         assert tensor.requires_grad, 'it must be True at this point, otherwise no modification occurs'
