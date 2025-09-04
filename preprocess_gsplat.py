@@ -130,7 +130,7 @@ def main(args: argparse.Namespace):
     model_name = 'naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt'
     model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(device)
 
-    # load_images can take a list of images or a directory
+    # Load_images can take a list of images or a directory
     file_glob = ['.jpg', '.jpeg', '.png', '.JPG', '.PNG']
     image_files = []
     for f in image_dir.iterdir():
@@ -138,6 +138,7 @@ def main(args: argparse.Namespace):
             if str(f).endswith(e):
                 image_files.append(f)
                 break
+
     print(f'Loading images from {image_dir} ({len(image_files)} files)')
 
     images = load_images([str(f) for f in image_files], size=args.resize)
@@ -180,7 +181,7 @@ def main(args: argparse.Namespace):
     loss = scene.compute_global_alignment(init=init, niter=args.niter, schedule=args.schedule, lr=args.lr)
     print(f'Global alignment loss: {loss:.4f}')
 
-    # retrieve useful values from scene:
+    # Retrieve useful values from scene:
     scene = scene.clean_pointcloud()
     imgs = scene.imgs
     poses = scene.get_im_poses()
@@ -293,7 +294,7 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--input', type=str, required=True)
     parser.add_argument('-r', '--resize', type=int, default=512)
     parser.add_argument('--gpu', type=int, default=0, help='Device to run the model on')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for inference')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for inference')
     parser.add_argument(
         '--schedule',
         type=str,
@@ -303,7 +304,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
     parser.add_argument('--niter', type=int, default=1000, help='Number of iterations')
-    parser.add_argument('--min_conf_thr', type=float, default=3.0, help='Confidence threshold')
+    parser.add_argument('--min_conf_thr', type=float, default=1.0, help='Confidence threshold')
     parser.add_argument('--single_camera', action='store_true', help='Use single camera mode')
     parser.add_argument('--preset_pose', action='store_true', help='Use preset poses from COLMAP')
 
