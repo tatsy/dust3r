@@ -3,9 +3,10 @@ name = "dust3r"
 version = "1.0.0"
 description = "DUSt3R: Geometric 3D Vision Made Easy"
 readme = "README.md"
-license = "CC BY-NC-SA 4.0"
+license = "CC-BY-NC-SA-4.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+py_modules = { include = ["dust3r", "dust3r.*"] }
 dependencies = [
   "einops>=0.8.1",
   "gradio>=5.42.0",
@@ -20,8 +21,6 @@ dependencies = [
   "trimesh>=4.7.4",
   "torch (>=2.6.0,<2.7.0)",
   "torchvision (>=0.21.0,<0.22.0)",
-  "ipywidgets>=8.1.7",
-  "ipykernel>=6.30.1",
   "plyfile>=1.1.2",
   "kapture>=1.1.10",
   "kapture-localization>=1.1.10",
@@ -35,9 +34,11 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "flake8-pyproject>=1.2.3",
-    "mypy>=1.17.1",
-    "ruff>=0.12.9",
+  "flake8-pyproject>=1.2.3",
+  "mypy>=1.17.1",
+  "ruff>=0.12.9",
+  "ipywidgets>=8.1.7",
+  "ipykernel>=6.30.1",
 ]
 
 [tool.uv.sources]
@@ -72,6 +73,13 @@ explicit = true
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["dust3r"]
+
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 120

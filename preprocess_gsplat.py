@@ -179,7 +179,7 @@ def main(args: argparse.Namespace):
     loss = scene.compute_global_alignment(init=init, niter=args.niter, schedule=args.schedule, lr=args.lr)
     print(f'Global alignment loss: {loss:.4f}')
 
-    # Retrieve useful values from scene:
+    # Retrieve useful values from scene
     scene = scene.clean_pointcloud()
     imgs = scene.imgs
     poses = scene.get_im_poses()
